@@ -1,0 +1,13 @@
+[package]
+name = "rtypescript"
+description = "RTypeScript: a from-scratch Rust TypeScript-subset tokenizer + type-annotation-stripping transpiler (TS-like syntax -> JS), the first crate of the RHTML5/RCSS3/RTypeScript/RBootStrap stack's client-logic layer."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/aon-co-jp/RTypeScript"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
