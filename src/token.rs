@@ -26,6 +26,12 @@ pub enum Token {
     Whitespace(String),
     /// `//`行コメント・`/* */`ブロックコメント(生テキストのまま保持)。
     Comment(String),
+    /// 変換パイプラインの中間段階(`interface`/`enum`/`class`パラメータ
+    /// プロパティ等)が生成した、既にJS相当に確定済みの生テキスト。
+    /// 後段のヒューリスティック(型注釈除去等)からは通常のトークンと
+    /// 区別せず「素通しする」対象として扱う(`Whitespace`/`Comment`と
+    /// 同じく非意味トークン扱い、`token_text`でそのまま出力される)。
+    Raw(String),
     Eof,
 }
 

@@ -22,22 +22,92 @@
 //! ヒューリスティックで判定する(ジェネリクス`<T>`のようなケースの
 //! 深さ追跡はスコープ外、単純な型名・配列型・関数型程度を想定)。
 
+use crate::classes::strip_class_syntax;
+use crate::enums::strip_enums;
+use crate::expressions::strip_expression_type_syntax;
+use crate::generics::strip_generics;
+use crate::interfaces::strip_interfaces_and_type_aliases;
 use crate::token::{CollectingSink, Token};
 use crate::tokenizer::tokenize;
 
-fn is_significant(t: &Token) -> bool {
-    !matches!(t, Token::Whitespace(_) | Token::Comment(_) | Token::Eof)
+pub(crate) fn is_significant(t: &Token) -> bool {
+    !matches!(t, Token::Whitespace(_) | Token::Comment(_) | Token::Raw(_) | Token::Eof)
 }
 
-fn token_text(t: &Token) -> &str {
+pub(crate) fn token_text(t: &Token) -> &str {
     match t {
         Token::Identifier(s)
         | Token::Number(s)
         | Token::StringLiteral(s)
         | Token::Punctuator(s)
         | Token::Whitespace(s)
-        | Token::Comment(s) => s,
+        | Token::Comment(s)
+        | Token::Raw(s) => s,
         Token::Eof => "",
+    }
+}
+
+/// クラス構文モジュール等、可視性修飾子・パラメータプロパティを
+/// 判定する際に使う予約語チェック(複数箇所から参照するため公開)。
+pub(crate) fn is_modifier_keyword(s: &str) -> bool {
+    matches!(s, "public" | "private" | "protected" | "readonly" | "abstract" | "override")
+}
+
+/// `start`(含む)以降で最初に見つかる意味のあるトークンのインデックスを返す
+/// (`interfaces`/`generics`/`classes`/`expressions`の各パスから共有する)。
+pub(crate) fn next_sig_index(tokens: &[Token], start: usize) -> Option<usize> {
+    (start..tokens.len()).find(|&i| is_significant(&tokens[i]))
+}
+
+/// `tokens[lt]`が`<`である前提で、対応する`>`のインデックスを返す
+/// (ジェネリクスの入れ子深さを追跡するだけの単純な実装。`>>`のような
+/// 複数文字トークンはトークナイザ側で単一トークン化しないため、
+/// この単純な深さ追跡で`Foo<Bar<Baz>>`のような入れ子も正しく扱える)。
+pub(crate) fn consume_angle_generic(tokens: &[Token], lt: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = lt;
+    loop {
+        match tokens.get(i) {
+            None => return None,
+            Some(Token::Eof) => return None,
+            Some(Token::Punctuator(p)) if p == "<" => {
+                depth += 1;
+                i += 1;
+            }
+            Some(Token::Punctuator(p)) if p == ">" => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// `tokens[open]`が開き括弧(`{`/`(`/`[`)である前提で、対応する
+/// 閉じ括弧のインデックスを返す。
+pub(crate) fn consume_matching_bracket(tokens: &[Token], open: usize, open_ch: &str, close_ch: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    loop {
+        match tokens.get(i) {
+            None => return None,
+            Some(Token::Eof) => return None,
+            Some(Token::Punctuator(p)) if p == open_ch => {
+                depth += 1;
+                i += 1;
+            }
+            Some(Token::Punctuator(p)) if p == close_ch => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
     }
 }
 
@@ -45,7 +115,7 @@ fn token_text(t: &Token) -> &str {
 /// (`(number) => void`と`=`の間の空白のような、区切り記号の直前の
 /// フォーマット用空白)は削らずに残す。そうしないと`x: number = 1`を
 /// 削った結果が`x= 1`のように詰まってしまうため。
-fn preserve_trailing_whitespace(tokens: &[Token], colon_index: usize, end: usize) -> usize {
+pub(crate) fn preserve_trailing_whitespace(tokens: &[Token], colon_index: usize, end: usize) -> usize {
     let mut keep_from = end;
     while keep_from > colon_index + 1 && matches!(tokens[keep_from - 1], Token::Whitespace(_)) {
         keep_from -= 1;
@@ -56,7 +126,7 @@ fn preserve_trailing_whitespace(tokens: &[Token], colon_index: usize, end: usize
 /// `start`から走査し、`(`/`[`/`{`のネスト深さが0の位置で`stops`に
 /// 含まれる記号に達したら、その記号のインデックス(まだ消費しない)を
 /// 返す。見つからなければトークン列の末尾を返す。
-fn find_type_end(tokens: &[Token], start: usize, stops: &[&str]) -> usize {
+pub(crate) fn find_type_end(tokens: &[Token], start: usize, stops: &[&str]) -> usize {
     let mut depth: i32 = 0;
     let mut i = start;
     while i < tokens.len() {
@@ -80,10 +150,31 @@ fn find_type_end(tokens: &[Token], start: usize, stops: &[&str]) -> usize {
 }
 
 /// ソース文字列をトークナイズしたうえで型注釈を除去する。
+///
+/// パイプライン(各段はトークン列→トークン列の変換、最終段のみ
+/// トークン列→文字列):
+/// 1. `interface`/`type`宣言の全体除去(JSランタイム表現を持たないため)
+/// 2. `enum`宣言の展開(実行時表現を持つため、tsc相当の数値enum
+///    (前方+逆引きマッピング付きIIFE)へ展開。文字列enumは逆引きなし)
+/// 3. クラス構文(可視性修飾子・コンストラクタのパラメータプロパティの
+///    `this.x = x`展開・クラスフィールドの型注釈/オプショナル`?`/
+///    確定代入`!`除去)
+/// 4. ジェネリクス型パラメータ(`function f<T>`・`class C<T>`・
+///    呼び出し側`foo<string>(...)`の`<...>`)の除去
+/// 5. 式レベルのTS専用構文(非null表明`x!`・型アサーション`x as T`)の除去
+///    (`import { a as b }`のリネーム構文とは区別する)
+/// 6. 変数宣言・関数パラメータ・戻り値型注釈(オプショナル`?`markerも
+///    含む)の除去、および最終的な文字列への再構成
 pub fn transpile(source: &str) -> String {
     let mut sink = CollectingSink::default();
     tokenize(source, &mut sink);
-    strip_type_annotations(&sink.tokens)
+    let tokens = sink.tokens;
+    let tokens = strip_interfaces_and_type_aliases(&tokens);
+    let tokens = strip_enums(&tokens);
+    let tokens = strip_class_syntax(&tokens);
+    let tokens = strip_generics(&tokens);
+    let tokens = strip_expression_type_syntax(&tokens);
+    strip_type_annotations(&tokens)
 }
 
 /// 既にトークナイズ済みの列から型注釈を除去してJS相当の文字列を作る
@@ -109,7 +200,30 @@ pub fn strip_type_annotations(tokens: &[Token]) -> String {
         }
 
         if let Token::Punctuator(p) = tok {
-            if p == ":" {
+            if p == "?" {
+                // オプショナルパラメータの`?`(`function f(a?: number)`・
+                // `function f(a?)`)。**次の意味のあるトークンが`:` /
+                // `,` / `)` / `=` のいずれかである場合に限り**除去する
+                // ——この即時後続チェックが、三項演算子`cond ? a : b`
+                // (`?`の直後に式が続く)との誤判定を防ぐ決め手になる
+                // (三項演算子なら`?`の直後は識別子等の式トークンであり、
+                // 上記の4記号のいずれにも一致しない)。
+                let prev = sig_history.last().map(|&idx| &tokens[idx]);
+                let prev2 = if sig_history.len() >= 2 { Some(&tokens[sig_history[sig_history.len() - 2]]) } else { None };
+                let is_param_position = matches!(prev, Some(Token::Identifier(_)))
+                    && paren_depth >= 1
+                    && matches!(prev2, Some(Token::Punctuator(pp)) if pp == "(" || pp == ",");
+
+                if is_param_position {
+                    let next_sig = tokens[i + 1..].iter().find(|t| is_significant(t));
+                    let looks_like_optional_marker =
+                        matches!(next_sig, Some(Token::Punctuator(np)) if matches!(np.as_str(), ":" | "," | ")" | "="));
+                    if looks_like_optional_marker {
+                        i += 1;
+                        continue;
+                    }
+                }
+            } else if p == ":" {
                 let prev = sig_history.last().map(|&idx| &tokens[idx]);
                 let prev2 = if sig_history.len() >= 2 { Some(&tokens[sig_history[sig_history.len() - 2]]) } else { None };
 

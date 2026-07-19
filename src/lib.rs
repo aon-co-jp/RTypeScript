@@ -18,6 +18,11 @@
 //! (`let x: T = 1, y: U = 2;`の2つ目以降)、Wasmへの直接コンパイル
 //! (実装方針B案)、swc AST取り込み(C案)。
 
+mod classes;
+mod enums;
+mod expressions;
+mod generics;
+mod interfaces;
 pub mod token;
 pub mod tokenizer;
 pub mod transpile;
